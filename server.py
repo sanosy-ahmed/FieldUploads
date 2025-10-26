@@ -1,0 +1,275 @@
+import os, traceback
+from datetime import datetime
+from fractions import Fraction
+from flask import Flask, request, jsonify, send_from_directory
+from flask_cors import CORS
+from openpyxl import load_workbook, Workbook
+from PIL import Image, ImageDraw, ImageFont
+
+# ===== إعدادات مسارات تخزين دائمة على Render =====
+BASE_DIR = os.environ.get("DATA_DIR", "/data")  # على Render سيُركّب القرص هنا
+UPLOAD_FOLDER = BASE_DIR
+IMAGES_FOLDER = os.path.join(UPLOAD_FOLDER, "images")
+EXCEL_FILE   = os.path.join(UPLOAD_FOLDER, "TaskLog.xlsx")
+ENABLE_EXIF  = True
+STAMP_ON_SAVE = True  # طباعة سطور على الصورة (بدون خلفية)
+
+os.makedirs(IMAGES_FOLDER, exist_ok=True)
+os.makedirs(UPLOAD_FOLDER, exist_ok=True)
+
+# piexif اختياري
+try:
+    import piexif
+    PEX_OK = True
+except Exception as e:
+    print("[WARN] piexif not available:", e)
+    PEX_OK = False
+
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
+CORS(app)  # اسمح من أي أصل؛ يمكنك تقييده لاحقاً
+
+LAST_ERR = None
+
+# ===== ختم النص على الصورة بخط كبير =====
+def stamp_text_on_image(img_path, lines, margin=12, pad=8, scale=5):
+    try:
+        with Image.open(img_path).convert("RGB") as im:
+            draw = ImageDraw.Draw(im)
+            # حجم خط كبير
+            base_size = max(12 * scale, 24)
+            try:
+                # خط افتراضي بسيط (قد لا يدعم العربية بشكل مثالي)
+                font = ImageFont.load_default()
+            except:
+                font = ImageFont.load_default()
+
+            # قياس ارتفاع الأسطر (تقريبي)
+            line_spacing = int(4 * scale)
+            W, H = im.size
+            # موضع البدء (أسفل يسار)
+            x = margin
+            # احسب إجمالي ارتفاع النص
+            total_h = 0
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font, anchor=None)
+                total_h += (bbox[3] - bbox[1]) + line_spacing
+            total_h -= line_spacing
+            y = H - margin - total_h
+
+            # اطبع النص باللون الأبيض مباشرة (بدون خلفية)
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font, anchor=None)
+                h = (bbox[3] - bbox[1])
+                draw.text((x, y), line, fill=(255, 255, 255), font=font)
+                y += h + line_spacing
+
+            im.save(img_path, "JPEG", quality=95)
+            return True
+    except Exception as e:
+        print("[WARN] stamping failed:", e)
+        return False
+
+# ===== Excel =====
+def ensure_excel():
+    if not os.path.exists(EXCEL_FILE):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "TaskLog"
+        ws.append(["رقم المهمة", "رقم المحطة", "ملاحظات", "اسم الصورة",
+                   "Latitude", "Longitude", "Timestamp", "Image URL"])
+        wb.save(EXCEL_FILE)
+
+def append_record(task_id, station_id, note, img_filename, lat, lon, img_url):
+    ensure_excel()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb["TaskLog"]
+        row = [task_id, station_id, note, img_filename, lat, lon, ts, img_url]
+        ws.append(row)
+        # أضف Hyperlink على خلية رابط الصورة
+        link_cell = ws.cell(row=ws.max_row, column=8)
+        link_cell.hyperlink = img_url
+        link_cell.style = "Hyperlink"
+        try:
+            wb.save(EXCEL_FILE)
+        except PermissionError:
+            tmp = os.path.join(UPLOAD_FOLDER, f"TaskLog_tmp_{datetime.now().strftime('%H%M%S')}.xlsx")
+            wb.save(tmp)
+            os.replace(tmp, EXCEL_FILE)
+    except Exception:
+        with open(os.path.join(UPLOAD_FOLDER, "TaskLog_fallback.csv"), "a", encoding="utf-8") as f:
+            f.write(f"{task_id},{station_id},{note},{img_filename},{lat},{lon},{ts},{img_url}\n")
+
+# ===== EXIF =====
+from fractions import Fraction as _Fraction
+
+def _rat(x: float):
+    fr = _Fraction(x).limit_denominator()
+    return (fr.numerator, fr.denominator)
+
+def _deg_to_dms_rationals(deg_float: float):
+    deg = int(abs(deg_float))
+    minutes_float = (abs(deg_float) - deg) * 60
+    minutes = int(minutes_float)
+    seconds = (minutes_float - minutes) * 60
+    return (_rat(deg), _rat(minutes), _rat(round(seconds, 2)))
+
+def _sanitize_exif_dict(d):
+    if not isinstance(d.get("0th"), dict): d["0th"] = {}
+    if not isinstance(d.get("1st"), dict): d["1st"] = {}
+    d["Exif"] = {}
+    if "thumbnail" not in d: d["thumbnail"] = None
+    if "GPS" not in d: d["GPS"] = {}
+    return d
+
+def write_gps_exif_jpeg_inplace(jpeg_path: str, lat_str: str, lon_str: str) -> bool:
+    if not (ENABLE_EXIF and PEX_OK):
+        return False
+    try:
+        lat = float(lat_str); lon = float(lon_str)
+    except:
+        print("[INFO] Skip EXIF: invalid lat/lon", lat_str, lon_str)
+        return False
+
+    lat_ref = "N" if lat >= 0 else "S"
+    lon_ref = "E" if lon >= 0 else "W"
+    lat_dms = _deg_to_dms_rationals(lat)
+    lon_dms = _deg_to_dms_rationals(lon)
+
+    try:
+        try:
+            exif_dict = piexif.load(jpeg_path)
+        except Exception:
+            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "thumbnail": None}
+        exif_dict = _sanitize_exif_dict(exif_dict)
+
+        gps = exif_dict["GPS"]
+        gps[piexif.GPSIFD.GPSVersionID]    = (2, 3, 0, 0)
+        gps[piexif.GPSIFD.GPSLatitudeRef]  = lat_ref.encode("ascii")
+        gps[piexif.GPSIFD.GPSLatitude]     = lat_dms
+        gps[piexif.GPSIFD.GPSLongitudeRef] = lon_ref.encode("ascii")
+        gps[piexif.GPSIFD.GPSLongitude]    = lon_dms
+
+        exif_bytes = piexif.dump(exif_dict)
+        with Image.open(jpeg_path) as im:
+            if im.mode != "RGB":
+                im = im.convert("RGB")
+            im.save(jpeg_path, "JPEG", quality=95, exif=exif_bytes)
+        return True
+    except Exception as e:
+        print("[WARN] EXIF write failed:", e)
+        return False
+
+def ensure_jpeg(src_path: str) -> str:
+    base, ext = os.path.splitext(src_path)
+    ext = ext.lower()
+    if ext in [".jpg", ".jpeg"]:
+        return src_path
+    dst_path = base + ".jpg"
+    with Image.open(src_path) as im:
+        if im.mode != "RGB":
+            im = im.convert("RGB")
+        im.save(dst_path, "JPEG", quality=95)
+    try:
+        os.remove(src_path)
+    except:
+        pass
+    return dst_path
+
+# ===== Routes =====
+@app.get("/ping")
+def ping():
+    return "pong"
+
+@app.get("/")
+def root():
+    return "<h3>FieldUploads server running ✅</h3><a href='/gallery'>Gallery</a>"
+
+@app.get("/images/<path:fname>")
+def get_image(fname):
+    return send_from_directory(IMAGES_FOLDER, fname, as_attachment=False)
+
+@app.get("/gallery")
+def gallery():
+    files = [f for f in os.listdir(IMAGES_FOLDER)
+             if f.lower().endswith((".jpg",".jpeg",".png",".webp"))]
+    files.sort(reverse=True)
+    cards = "".join(
+        f"<div style='margin:8px'><img src='/images/{f}' style='max-width:240px;display:block'><small>{f}</small></div>"
+        for f in files[:100]
+    )
+    return f"<html><body style='font-family:sans-serif;padding:12px'><h3>Gallery</h3><div style='display:flex;flex-wrap:wrap'>{cards}</div></body></html>"
+
+@app.get("/debug_last")
+def debug_last():
+    global LAST_ERR
+    return jsonify({"ok": LAST_ERR is None, "last_error": LAST_ERR}), 200 if LAST_ERR is None else 500
+
+@app.post("/upload")
+def upload():
+    global LAST_ERR
+    LAST_ERR = None
+    try:
+        if 'image' not in request.files:
+            return jsonify({"ok": False, "error": "no image part"}), 400
+
+        image = request.files['image']
+        task_id    = (request.form.get('task_id')    or '').strip()
+        station_id = (request.form.get('station_id') or '').strip()
+        note       = (request.form.get('note')       or '').strip()
+        latitude   = (request.form.get('latitude')   or '').strip()
+        longitude  = (request.form.get('longitude')  or '').strip()
+
+        if not task_id:
+            return jsonify({"ok": False, "error": "task_id required"}), 400
+        if image.filename == '':
+            return jsonify({"ok": False, "error": "empty filename"}), 400
+
+        raw_name = f"{task_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{image.filename}"
+        raw_path = os.path.join(IMAGES_FOLDER, raw_name)
+        image.save(raw_path)
+
+        final_path = ensure_jpeg(raw_path)
+        final_name = os.path.basename(final_path)
+
+        # URL عام على Render
+        base = request.host_url.rstrip('/')
+        img_url = f"{base}/images/{final_name}"
+
+        # سجّل في Excel (مع Hyperlink)
+        append_record(task_id, station_id, note, final_name, latitude, longitude, img_url=img_url)
+
+        # اكتب EXIF GPS (لا يوقف العملية لو فشل)
+        exif_ok = write_gps_exif_jpeg_inplace(final_path, latitude, longitude)
+
+        # اطبع نصًا على الصورة (اختياري)
+        stamp_ok = False
+        if STAMP_ON_SAVE:
+            ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines = [
+                f"Task: {task_id}  |  Station: {station_id}",
+                f"Lat: {latitude}  |  Lon: {longitude}",
+                f"Time: {ts_str}",
+                f"File: {final_name}",
+            ]
+            stamp_ok = stamp_text_on_image(final_path, lines)
+
+        return jsonify({
+            "ok": True,
+            "saved": final_name,
+            "url": img_url,
+            "exif_gps_written": bool(exif_ok and ENABLE_EXIF and PEX_OK),
+            "stamped": stamp_ok
+        }), 200
+
+    except Exception as e:
+        LAST_ERR = f"{type(e).__name__}: {e}"
+        traceback.print_exc()
+        return jsonify({"ok": False, "error": f"server-error: {type(e).__name__}: {e}"}), 500
+
+if __name__ == "__main__":
+    # على Render سيستبدل PORT بمتغير بيئة
+    port = int(os.environ.get("PORT", "5000"))
+    app.run(host="0.0.0.0", port=port, debug=False)
