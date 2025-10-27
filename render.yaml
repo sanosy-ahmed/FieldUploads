@@ -3,13 +3,26 @@ services:
     name: field-uploads
     env: python
     plan: free
-
     buildCommand: "pip install -r requirements.txt"
     startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT server:app"
     autoDeploy: true
-
     envVars:
       - key: PYTHONUNBUFFERED
         value: "true"
-      - key: DATA_DIR
-        value: "/opt/render/project/src/data"
+
+      # ← ضع القيم الآتية من Cloudflare R2
+      - key: R2_ACCOUNT_ID
+        sync: false
+      - key: R2_ACCESS_KEY_ID
+        sync: false
+      - key: R2_SECRET_ACCESS_KEY
+        sync: false
+
+      # اسم البكت في R2 (مثلاً: fielduploads)
+      - key: R2_BUCKET
+        value: "fielduploads"
+
+      # إن كان البكت Public ضع رابطه العام هنا ليسهّل إنشاء روابط مباشرة
+      # مثال: https://fielduploads.<ACCOUNT_ID>.r2.cloudflarestorage.com
+      - key: R2_PUBLIC_BASE_URL
+        value: "https://fielduploads.<ACCOUNT_ID>.r2.cloudflarestorage.com"
