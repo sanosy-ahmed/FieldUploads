@@ -8,13 +8,8 @@ services:
     startCommand: "gunicorn -w 2 -k gthread -b 0.0.0.0:$PORT server:app"
     autoDeploy: true
 
-    disk:
-      name: data
-      mountPath: /data
-      sizeGB: 1
-
     envVars:
       - key: PYTHONUNBUFFERED
         value: "true"
       - key: DATA_DIR
-        value: "/data"
+        value: "/opt/render/project/src/data"
