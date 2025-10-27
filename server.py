@@ -1,23 +1,29 @@
-import os, traceback
+import os
+import traceback
 from datetime import datetime
-from fractions import Fraction
+from fractions import Fraction as _Fraction
+
 from flask import Flask, request, jsonify, send_from_directory
 from flask_cors import CORS
 from openpyxl import load_workbook, Workbook
 from PIL import Image, ImageDraw, ImageFont
 
-# ===== إعدادات مسارات تخزين دائمة على Render =====
-BASE_DIR = os.environ.get("DATA_DIR", "/data")  # على Render سيُركّب القرص هنا
+# ============== إعدادات أساسية ==============
+# في Render لا يوجد تخزين دائم في الخطة المجانية، لذا نخزن مؤقتاً داخل الحاوية
+# ثم نرفع النسخ النهائية إلى R2. سنستخدم مجلد "data" داخل المشروع كمسار عمل.
+BASE_DIR = os.path.join(os.getcwd(), "data")
 UPLOAD_FOLDER = BASE_DIR
 IMAGES_FOLDER = os.path.join(UPLOAD_FOLDER, "images")
-EXCEL_FILE   = os.path.join(UPLOAD_FOLDER, "TaskLog.xlsx")
-ENABLE_EXIF  = True
-STAMP_ON_SAVE = True  # طباعة سطور على الصورة (بدون خلفية)
+EXCEL_FILE = os.path.join(UPLOAD_FOLDER, "TaskLog.xlsx")
+
+ENABLE_EXIF = True                 # محاولة كتابة EXIF GPS
+STAMP_ON_SAVE = True               # طباعة نص معلومات على الصورة
+MAX_UPLOAD_MB = 50                 # حد حجم الملف
 
 os.makedirs(IMAGES_FOLDER, exist_ok=True)
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# piexif اختياري
+# ============== piexif (اختياري) ==============
 try:
     import piexif
     PEX_OK = True
@@ -25,86 +31,54 @@ except Exception as e:
     print("[WARN] piexif not available:", e)
     PEX_OK = False
 
-app = Flask(__name__)
-app.config['MAX_CONTENT_LENGTH'] = 50 * 1024 * 1024  # 50MB
-CORS(app)  # اسمح من أي أصل؛ يمكنك تقييده لاحقاً
+# ============== Cloudflare R2 عبر boto3 ==============
+import boto3
 
-LAST_ERR = None
+R2_ACCOUNT_ID = os.getenv("R2_ACCOUNT_ID", "")
+R2_ACCESS_KEY_ID = os.getenv("R2_ACCESS_KEY_ID", "")
+R2_SECRET_ACCESS_KEY = os.getenv("R2_SECRET_ACCESS_KEY", "")
+R2_BUCKET = os.getenv("R2_BUCKET", "")
+# إن كان البكت Public فعّل هذا بالرابط العام (اختياري لكنه مريح)
+R2_PUBLIC_BASE_URL = os.getenv("R2_PUBLIC_BASE_URL", "")  # مثال: https://fielduploads.<acc-id>.r2.cloudflarestorage.com
 
-# ===== ختم النص على الصورة بخط كبير =====
-def stamp_text_on_image(img_path, lines, margin=12, pad=8, scale=5):
+def get_r2_client():
+    if not (R2_ACCOUNT_ID and R2_ACCESS_KEY_ID and R2_SECRET_ACCESS_KEY and R2_BUCKET):
+        return None
+    return boto3.client(
+        "s3",
+        endpoint_url=f"https://{R2_ACCOUNT_ID}.r2.cloudflarestorage.com",
+        aws_access_key_id=R2_ACCESS_KEY_ID,
+        aws_secret_access_key=R2_SECRET_ACCESS_KEY,
+        region_name="auto",
+    )
+
+def r2_upload(local_path: str, key: str) -> bool:
+    """يرفع ملفاً إلى R2 تحت المفتاح المعطى."""
     try:
-        with Image.open(img_path).convert("RGB") as im:
-            draw = ImageDraw.Draw(im)
-            # حجم خط كبير
-            base_size = max(12 * scale, 24)
-            try:
-                # خط افتراضي بسيط (قد لا يدعم العربية بشكل مثالي)
-                font = ImageFont.load_default()
-            except:
-                font = ImageFont.load_default()
-
-            # قياس ارتفاع الأسطر (تقريبي)
-            line_spacing = int(4 * scale)
-            W, H = im.size
-            # موضع البدء (أسفل يسار)
-            x = margin
-            # احسب إجمالي ارتفاع النص
-            total_h = 0
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font, anchor=None)
-                total_h += (bbox[3] - bbox[1]) + line_spacing
-            total_h -= line_spacing
-            y = H - margin - total_h
-
-            # اطبع النص باللون الأبيض مباشرة (بدون خلفية)
-            for line in lines:
-                bbox = draw.textbbox((0, 0), line, font=font, anchor=None)
-                h = (bbox[3] - bbox[1])
-                draw.text((x, y), line, fill=(255, 255, 255), font=font)
-                y += h + line_spacing
-
-            im.save(img_path, "JPEG", quality=95)
-            return True
+        s3 = get_r2_client()
+        if s3 is None:
+            print("[INFO] R2 not configured; skipping upload")
+            return False
+        s3.upload_file(local_path, R2_BUCKET, key)
+        return True
     except Exception as e:
-        print("[WARN] stamping failed:", e)
+        print("[WARN] R2 upload failed:", e)
         return False
 
-# ===== Excel =====
-def ensure_excel():
-    if not os.path.exists(EXCEL_FILE):
-        wb = Workbook()
-        ws = wb.active
-        ws.title = "TaskLog"
-        ws.append(["رقم المهمة", "رقم المحطة", "ملاحظات", "اسم الصورة",
-                   "Latitude", "Longitude", "Timestamp", "Image URL"])
-        wb.save(EXCEL_FILE)
+def r2_public_url(key: str) -> str:
+    """يبني رابطاً عاماً للملف إن كان لديك R2_PUBLIC_BASE_URL."""
+    if R2_PUBLIC_BASE_URL:
+        base = R2_PUBLIC_BASE_URL.rstrip('/')
+        return f"{base}/{key.lstrip('/')}"
+    return ""
 
-def append_record(task_id, station_id, note, img_filename, lat, lon, img_url):
-    ensure_excel()
-    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    try:
-        wb = load_workbook(EXCEL_FILE)
-        ws = wb["TaskLog"]
-        row = [task_id, station_id, note, img_filename, lat, lon, ts, img_url]
-        ws.append(row)
-        # أضف Hyperlink على خلية رابط الصورة
-        link_cell = ws.cell(row=ws.max_row, column=8)
-        link_cell.hyperlink = img_url
-        link_cell.style = "Hyperlink"
-        try:
-            wb.save(EXCEL_FILE)
-        except PermissionError:
-            tmp = os.path.join(UPLOAD_FOLDER, f"TaskLog_tmp_{datetime.now().strftime('%H%M%S')}.xlsx")
-            wb.save(tmp)
-            os.replace(tmp, EXCEL_FILE)
-    except Exception:
-        with open(os.path.join(UPLOAD_FOLDER, "TaskLog_fallback.csv"), "a", encoding="utf-8") as f:
-            f.write(f"{task_id},{station_id},{note},{img_filename},{lat},{lon},{ts},{img_url}\n")
+# ============== Flask ==============
+app = Flask(__name__)
+app.config['MAX_CONTENT_LENGTH'] = MAX_UPLOAD_MB * 1024 * 1024
+CORS(app)
+LAST_ERR = None
 
-# ===== EXIF =====
-from fractions import Fraction as _Fraction
-
+# ============== أدوات EXIF ==============
 def _rat(x: float):
     fr = _Fraction(x).limit_denominator()
     return (fr.numerator, fr.denominator)
@@ -178,7 +152,78 @@ def ensure_jpeg(src_path: str) -> str:
         pass
     return dst_path
 
-# ===== Routes =====
+# ============== ختم نص على الصورة ==============
+def stamp_text_on_image(img_path, lines, margin=12, line_spacing=10, scale=5):
+    """
+    يطبع سطور معلومات باللون الأبيض أسفل يسار الصورة (بدون خلفية).
+    يستخدم خط PIL الافتراضي (قد لا يعرض العربية مثاليًا لكن الأرقام/لاتيني ممتازة).
+    scale لتكبير الخط (5≈ كبير).
+    """
+    try:
+        with Image.open(img_path).convert("RGB") as im:
+            draw = ImageDraw.Draw(im)
+            # لا نعتمد على TTF. نستخدم خط PIL الافتراضي ونكرر الرسم لتكبير بصري.
+            font = ImageFont.load_default()
+            W, H = im.size
+
+            # احسب إجمالي الارتفاع
+            total_h = 0
+            heights = []
+            for line in lines:
+                bbox = draw.textbbox((0, 0), line, font=font)
+                h = (bbox[3] - bbox[1]) * scale
+                heights.append(h)
+                total_h += h + line_spacing
+            total_h -= line_spacing
+
+            x = margin
+            y = H - margin - total_h
+
+            # ارسم كل سطر مكبّرًا بتكرار الطباعة (scale مرات عموديًا وأفقيًا)
+            for idx, line in enumerate(lines):
+                # طباعة مكبرة: شبكة scale x scale
+                for dx in range(scale):
+                    for dy in range(scale):
+                        draw.text((x + dx, y + dy), line, fill=(255, 255, 255), font=font)
+                y += heights[idx] + line_spacing
+
+            im.save(img_path, "JPEG", quality=95)
+            return True
+    except Exception as e:
+        print("[WARN] stamping failed:", e)
+        return False
+
+# ============== Excel ==============
+def ensure_excel():
+    if not os.path.exists(EXCEL_FILE):
+        wb = Workbook()
+        ws = wb.active
+        ws.title = "TaskLog"
+        ws.append(["رقم المهمة", "رقم المحطة", "ملاحظات", "اسم الصورة",
+                   "Latitude", "Longitude", "Timestamp", "Image URL"])
+        wb.save(EXCEL_FILE)
+
+def append_record(task_id, station_id, note, img_filename, lat, lon, img_url):
+    ensure_excel()
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    try:
+        wb = load_workbook(EXCEL_FILE)
+        ws = wb["TaskLog"]
+        ws.append([task_id, station_id, note, img_filename, lat, lon, ts, img_url])
+        link_cell = ws.cell(row=ws.max_row, column=8)
+        link_cell.hyperlink = img_url
+        link_cell.style = "Hyperlink"
+        try:
+            wb.save(EXCEL_FILE)
+        except PermissionError:
+            tmp = os.path.join(UPLOAD_FOLDER, f"TaskLog_tmp_{datetime.now().strftime('%H%M%S')}.xlsx")
+            wb.save(tmp)
+            os.replace(tmp, EXCEL_FILE)
+    except Exception:
+        with open(os.path.join(UPLOAD_FOLDER, "TaskLog_fallback.csv"), "a", encoding="utf-8") as f:
+            f.write(f"{task_id},{station_id},{note},{img_filename},{lat},{lon},{ts},{img_url}\n")
+
+# ============== Routes ==============
 @app.get("/ping")
 def ping():
     return "pong"
@@ -194,7 +239,7 @@ def get_image(fname):
 @app.get("/gallery")
 def gallery():
     files = [f for f in os.listdir(IMAGES_FOLDER)
-             if f.lower().endswith((".jpg",".jpeg",".png",".webp"))]
+             if f.lower().endswith((".jpg", ".jpeg", ".png", ".webp"))]
     files.sort(reverse=True)
     cards = "".join(
         f"<div style='margin:8px'><img src='/images/{f}' style='max-width:240px;display:block'><small>{f}</small></div>"
@@ -227,24 +272,33 @@ def upload():
         if image.filename == '':
             return jsonify({"ok": False, "error": "empty filename"}), 400
 
+        # احفظ كما وصل
         raw_name = f"{task_id}_{datetime.now().strftime('%Y%m%d%H%M%S')}_{image.filename}"
         raw_path = os.path.join(IMAGES_FOLDER, raw_name)
         image.save(raw_path)
 
+        # ضمن JPG
         final_path = ensure_jpeg(raw_path)
         final_name = os.path.basename(final_path)
 
-        # URL عام على Render
-        base = request.host_url.rstrip('/')
-        img_url = f"{base}/images/{final_name}"
+        # حاول رفع الصورة إلى R2 أولاً
+        r2_key_img = f"images/{final_name}"
+        r2_ok = r2_upload(final_path, r2_key_img)
 
-        # سجّل في Excel (مع Hyperlink)
-        append_record(task_id, station_id, note, final_name, latitude, longitude, img_url=img_url)
+        # حدد رابط الصورة المعلن
+        if r2_ok and R2_PUBLIC_BASE_URL:
+            img_url = r2_public_url(r2_key_img)
+        else:
+            base = request.host_url.rstrip('/')
+            img_url = f"{base}/images/{final_name}"
 
-        # اكتب EXIF GPS (لا يوقف العملية لو فشل)
+        # سجّل في Excel (مع الرابط)
+        append_record(task_id, station_id, note, final_name, latitude, longitude, img_url)
+
+        # حاول كتابة EXIF GPS (لا يوقف العملية لو فشل)
         exif_ok = write_gps_exif_jpeg_inplace(final_path, latitude, longitude)
 
-        # اطبع نصًا على الصورة (اختياري)
+        # طباعة نص معلومات على الصورة (اختياري)
         stamp_ok = False
         if STAMP_ON_SAVE:
             ts_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -254,14 +308,18 @@ def upload():
                 f"Time: {ts_str}",
                 f"File: {final_name}",
             ]
-            stamp_ok = stamp_text_on_image(final_path, lines)
+            stamp_ok = stamp_text_on_image(final_path, lines, scale=5)
+
+        # ارفع Excel أيضاً إلى R2 لضمان نسخة دائمة
+        r2_upload(EXCEL_FILE, "TaskLog.xlsx")
 
         return jsonify({
             "ok": True,
             "saved": final_name,
             "url": img_url,
             "exif_gps_written": bool(exif_ok and ENABLE_EXIF and PEX_OK),
-            "stamped": stamp_ok
+            "stamped": stamp_ok,
+            "r2_upload": r2_ok
         }), 200
 
     except Exception as e:
@@ -270,6 +328,6 @@ def upload():
         return jsonify({"ok": False, "error": f"server-error: {type(e).__name__}: {e}"}), 500
 
 if __name__ == "__main__":
-    # على Render سيستبدل PORT بمتغير بيئة
     port = int(os.environ.get("PORT", "5000"))
+    print(f"[INFO] Server starting on 0.0.0.0:{port}")
     app.run(host="0.0.0.0", port=port, debug=False)
