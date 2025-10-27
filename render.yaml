@@ -13,3 +13,4 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "true"
+      rootDir: src
