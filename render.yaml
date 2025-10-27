@@ -9,20 +9,6 @@ services:
     envVars:
       - key: PYTHONUNBUFFERED
         value: "true"
-
-      # ← ضع القيم الآتية من Cloudflare R2
-      - key: R2_ACCOUNT_ID
-        sync: false
-      - key: R2_ACCESS_KEY_ID
-        sync: false
-      - key: R2_SECRET_ACCESS_KEY
-        sync: false
-
-      # اسم البكت في R2 (مثلاً: fielduploads)
-      - key: R2_BUCKET
-        value: "fielduploads"
-
-      # إن كان البكت Public ضع رابطه العام هنا ليسهّل إنشاء روابط مباشرة
-      # مثال: https://fielduploads.<ACCOUNT_ID>.r2.cloudflarestorage.com
-      - key: R2_PUBLIC_BASE_URL
-        value: "https://fielduploads.<ACCOUNT_ID>.r2.cloudflarestorage.com"
+      # اختياري: اضبطه لفرض أصل الروابط (إن لم تُرِد الاعتماد على request.host_url)
+      # - key: BASE_URL
+      #   value: "https://field-uploads.onrender.com"
